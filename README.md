@@ -1,5 +1,5 @@
 # legacy-dotnet-utils
-This repository contains the old outdated Hajk dotnet backend and a few dotnet proxies that has been removed from the Hajk base project. 
+This repository contains the old outdated Hajk .NET 4.5 backend and a few .NET proxies that has been removed from the Hajk base project. 
 
 The code is only copied and simply just pushed to this repo so no history is present.
 
