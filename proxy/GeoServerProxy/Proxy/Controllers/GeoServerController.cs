@@ -80,11 +80,11 @@ namespace Proxy.Controllers
             return _proxyBaseUrl;
         }
 
-        private async Task DoMethod(string method, string urlPath, string queryString, string body, string contentType, Encoding contentEncoding)
+        private async Task DoMethod(string method, string urlPath, string queryString, byte[] body, string contentType)
         {
             try
             {
-                _log.DebugFormat("DoMethod incomig method: {0}, urlPath: {1}, queryString, {2}, body: {3}", method, urlPath, queryString, body);
+                _log.DebugFormat("DoMethod incomig method: {0}, urlPath: {1}, queryString, {2}, contentType: {3}, body length: {4}", method, urlPath, queryString, contentType, body == null ? 0 : body.Length);
 
                 string url = GetlocalhostServer() + urlPath;
                 if (!string.IsNullOrEmpty(queryString))
@@ -110,13 +110,13 @@ namespace Proxy.Controllers
 
                 if (method == "POST")
                 {
-                    byte[] bodyAsBytes;
-                    bodyAsBytes = contentEncoding.GetBytes(body);
-                    request.ContentType = "text/xml; encoding=" + contentEncoding.HeaderName;// 'utf-8'";
-                    request.ContentLength = bodyAsBytes.Length;
+                    // Forward the body bytes and Content-Type unchanged: WFS POST can be XML (GetFeature, Transaction)
+                    // or form-encoded KVP, and re-encoding the body would break non-UTF-8 XML
+                    request.ContentType = string.IsNullOrEmpty(contentType) ? "text/xml" : contentType;
+                    request.ContentLength = body.Length;
 
                     Stream requestStream = request.GetRequestStream();
-                    requestStream.Write(bodyAsBytes, 0, bodyAsBytes.Length);
+                    requestStream.Write(body, 0, body.Length);
                     requestStream.Close();
                 }
 
@@ -131,93 +131,120 @@ namespace Proxy.Controllers
 
         private async Task HandleResponse(HttpWebRequest request)
         {
-            const int BUFFER_SIZE = 1024 * 1024;
-
             if (request != null)
             {
+                // Only the request itself is inside try: once CopyResponse has started streaming,
+                // the headers are sent and the status code can no longer be changed
+                WebResponse resp;
                 try
                 {
-                    using (var resp = await request.GetResponseAsync())
-                    {
-                        using (var stream = resp.GetResponseStream())
-                        {
-                            if (GetProxyBaseUrl().Length > 0 && 
-                                (resp.ContentType.StartsWith("application/vnd.ogc.wms_xml") || 
-                                resp.ContentType.StartsWith( "text/xml") || 
-                                resp.ContentType.StartsWith("application/xml")))
-                            {
-                                var ms = new MemoryStream();
-                                stream.CopyTo(ms);
-                                byte[] bytes = ms.ToArray();
-
-                                _log.DebugFormat("Response handled the new way, ContentType={0}", resp.ContentType);
-
-                                _log.DebugFormat("Response - content-encodig: {0}", resp.Headers["content-encoding"]);
-
-                                bool compressionUsed = resp.Headers["content-encoding"] == "gzip" ? true : false;
-                                if (compressionUsed)
-                                {
-                                    bytes = Compress(bytes, CompressionMode.Decompress);
-                                }
-                                var strResponse = Encoding.UTF8.GetString(bytes); // Assume that GeoServer returns GetCapabilities in UTF8. Maybe add this to Web.config
-                                //_log.DebugFormat("Response stream, before replacement: {0}", strResponse);
-
-                                var strResponseReplaced = strResponse.Replace(GetlocalhostServer(), GetProxyBaseUrl());
-                                _log.DebugFormat("Response stream, after replacement: {0}", strResponseReplaced);
-
-                                byte[] byteResponseReplaced = Encoding.UTF8.GetBytes(strResponseReplaced);
-                                if (compressionUsed)
-                                {
-                                    byteResponseReplaced = Compress(byteResponseReplaced, CompressionMode.Compress);
-                                }
-
-                                Response.OutputStream.Write(byteResponseReplaced, 0, byteResponseReplaced.Length);
-                                Response.ContentType = "text/xml";
-                            }
-                            else
-                            {
-                                _log.DebugFormat("Response handled the old way, ContentType={0}", resp.ContentType);
-
-                                var bytes = new byte[BUFFER_SIZE];
-                                while (true)
-                                {
-                                    var n = stream.Read(bytes, 0, BUFFER_SIZE);
-                                    if (n == 0)
-                                    {
-                                        break;
-                                    }
-                                    Response.OutputStream.Write(bytes, 0, n);
-                                }
-                                Response.ContentType = resp.ContentType;
-                            }
-                        }
-                        // Copy GeoWebCache Headers
-                        foreach (var headerName in resp.Headers.AllKeys)
-                        {
-                            if (headerName.StartsWith("geowebcache"))
-                            {
-                                Response.Headers.Add(headerName, resp.Headers[headerName]);
-                            }
-                        }
-                        // Pass on GeoServer's client cache time (Publishing tab / GWC expireClients).
-                        // Set it through Response.Cache: ASP.NET overwrites a Cache-Control header added via Response.Headers.
-                        var cacheControl = resp.Headers["Cache-Control"];
-                        var maxAge = cacheControl == null ? null : Regex.Match(cacheControl, @"max-age=(\d+)");
-                        if (maxAge != null && maxAge.Success)
-                        {
-                            // Private: responses can depend on the user sent in headerAttributeName, so no shared caches
-                            Response.Cache.SetCacheability(HttpCacheability.Private);
-                            Response.Cache.SetMaxAge(TimeSpan.FromSeconds(int.Parse(maxAge.Groups[1].Value)));
-                            if (cacheControl.Contains("must-revalidate"))
-                                Response.Cache.SetRevalidation(HttpCacheRevalidation.AllCaches);
-                        }
-                    }
+                    resp = await request.GetResponseAsync();
                 }
                 catch (WebException e)
                 {
                     _log.WarnFormat("Exception in HandleResponse: Status: {0}, Message: {1}", e.Status, e.Message);
                     Response.StatusCode = GetHttpStatusCode(e);
-                    Response.StatusDescription = e.Message;
+                    var errorResp = e.Response as HttpWebResponse;
+                    Response.StatusDescription = errorResp != null && !string.IsNullOrEmpty(errorResp.StatusDescription) ? errorResp.StatusDescription : e.Message;
+                    if (e.Response == null)
+                        return;
+                    // Pass on GeoServer's error body, e.g. the OGC ExceptionReport that WFS 2.0 returns with HTTP 400.
+                    // Otherwise IIS replaces the body of 4xx/5xx responses with its own error page
+                    Response.TrySkipIisCustomErrors = true;
+                    resp = e.Response;
+                }
+                using (resp)
+                {
+                    CopyResponse(resp);
+                }
+            }
+        }
+
+        private void CopyResponse(WebResponse resp)
+        {
+            const int BUFFER_SIZE = 1024 * 1024;
+
+            // Set all headers before writing the body: with BufferOutput off they are sent on the first write
+            // Copy GeoWebCache Headers
+            foreach (var headerName in resp.Headers.AllKeys)
+            {
+                if (headerName.StartsWith("geowebcache"))
+                {
+                    Response.Headers.Add(headerName, resp.Headers[headerName]);
+                }
+            }
+            // File name for downloads, e.g. WFS outputFormat=shape-zip or csv
+            var contentDisposition = resp.Headers["Content-Disposition"];
+            if (!string.IsNullOrEmpty(contentDisposition))
+            {
+                Response.Headers.Add("Content-Disposition", contentDisposition);
+            }
+            // Pass on GeoServer's client cache time (Publishing tab / GWC expireClients).
+            // Set it through Response.Cache: ASP.NET overwrites a Cache-Control header added via Response.Headers.
+            var cacheControl = resp.Headers["Cache-Control"];
+            var maxAge = cacheControl == null ? null : Regex.Match(cacheControl, @"max-age=(\d+)");
+            if (maxAge != null && maxAge.Success)
+            {
+                // Private: responses can depend on the user sent in headerAttributeName, so no shared caches
+                Response.Cache.SetCacheability(HttpCacheability.Private);
+                Response.Cache.SetMaxAge(TimeSpan.FromSeconds(int.Parse(maxAge.Groups[1].Value)));
+                if (cacheControl.Contains("must-revalidate"))
+                    Response.Cache.SetRevalidation(HttpCacheRevalidation.AllCaches);
+            }
+
+            using (var stream = resp.GetResponseStream())
+            {
+                if (GetProxyBaseUrl().Length > 0 &&
+                    (resp.ContentType.StartsWith("application/vnd.ogc.wms_xml") ||
+                    resp.ContentType.StartsWith( "text/xml") ||
+                    resp.ContentType.StartsWith("application/xml")))
+                {
+                    var ms = new MemoryStream();
+                    stream.CopyTo(ms);
+                    byte[] bytes = ms.ToArray();
+
+                    _log.DebugFormat("Response handled the new way, ContentType={0}", resp.ContentType);
+
+                    _log.DebugFormat("Response - content-encodig: {0}", resp.Headers["content-encoding"]);
+
+                    bool compressionUsed = resp.Headers["content-encoding"] == "gzip" ? true : false;
+                    if (compressionUsed)
+                    {
+                        bytes = Compress(bytes, CompressionMode.Decompress);
+                    }
+                    var strResponse = Encoding.UTF8.GetString(bytes); // Assume that GeoServer returns GetCapabilities in UTF8. Maybe add this to Web.config
+                    //_log.DebugFormat("Response stream, before replacement: {0}", strResponse);
+
+                    var strResponseReplaced = strResponse.Replace(GetlocalhostServer(), GetProxyBaseUrl());
+                    _log.DebugFormat("Response stream, after replacement: {0}", strResponseReplaced);
+
+                    byte[] byteResponseReplaced = Encoding.UTF8.GetBytes(strResponseReplaced);
+                    if (compressionUsed)
+                    {
+                        byteResponseReplaced = Compress(byteResponseReplaced, CompressionMode.Compress);
+                    }
+
+                    // Keep GeoServer's type for WFS, e.g. "text/xml; subtype=gml/3.1.1", which clients use to pick the GML version
+                    Response.ContentType = resp.ContentType.StartsWith("application/vnd.ogc.wms_xml") ? "text/xml" : resp.ContentType;
+                    Response.OutputStream.Write(byteResponseReplaced, 0, byteResponseReplaced.Length);
+                }
+                else
+                {
+                    _log.DebugFormat("Response handled the old way, ContentType={0}", resp.ContentType);
+
+                    Response.ContentType = resp.ContentType;
+                    // Stream large responses (e.g. WFS GetFeature) to the client instead of holding them in memory first
+                    Response.BufferOutput = false;
+                    var bytes = new byte[BUFFER_SIZE];
+                    while (true)
+                    {
+                        var n = stream.Read(bytes, 0, BUFFER_SIZE);
+                        if (n == 0)
+                        {
+                            break;
+                        }
+                        Response.OutputStream.Write(bytes, 0, n);
+                    }
                 }
             }
         }
@@ -280,21 +307,20 @@ namespace Proxy.Controllers
             }
             else
             {
-                var contentType = Request.ContentType;
-                var contentEncoding = Request.ContentEncoding;
-                string body = "";
+                byte[] body = null;
 
                 if (Request.HttpMethod == "POST")
                 {
-                    using (Stream receiveStream = Request.InputStream)
+                    using (var ms = new MemoryStream())
                     {
-                        using (StreamReader readStream = new StreamReader(receiveStream, Request.ContentEncoding))
-                        {
-                            body = readStream.ReadToEnd();
-                        }
+                        // MVC model binding may already have read the stream (e.g. Request.Form for form-encoded POSTs)
+                        Request.InputStream.Position = 0;
+                        Request.InputStream.CopyTo(ms);
+                        body = ms.ToArray();
                     }
                 }
-                await this.DoMethod(Request.HttpMethod, url, Request.QueryString.ToString(), body, contentType, contentEncoding);
+                // Raw query string: Request.QueryString.ToString() decodes and re-encodes it, which can alter filter values
+                await this.DoMethod(Request.HttpMethod, url, Request.ServerVariables["QUERY_STRING"], body, Request.ContentType);
             }
             return new MyActionResult();
         }
