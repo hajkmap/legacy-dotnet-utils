@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Security.Principal;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web;
 using System.Web.Mvc;
@@ -197,6 +198,18 @@ namespace Proxy.Controllers
                             {
                                 Response.Headers.Add(headerName, resp.Headers[headerName]);
                             }
+                        }
+                        // Pass on GeoServer's client cache time (Publishing tab / GWC expireClients).
+                        // Set it through Response.Cache: ASP.NET overwrites a Cache-Control header added via Response.Headers.
+                        var cacheControl = resp.Headers["Cache-Control"];
+                        var maxAge = cacheControl == null ? null : Regex.Match(cacheControl, @"max-age=(\d+)");
+                        if (maxAge != null && maxAge.Success)
+                        {
+                            // Private: responses can depend on the user sent in headerAttributeName, so no shared caches
+                            Response.Cache.SetCacheability(HttpCacheability.Private);
+                            Response.Cache.SetMaxAge(TimeSpan.FromSeconds(int.Parse(maxAge.Groups[1].Value)));
+                            if (cacheControl.Contains("must-revalidate"))
+                                Response.Cache.SetRevalidation(HttpCacheRevalidation.AllCaches);
                         }
                     }
                 }
